@@ -52,7 +52,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.0-flash
 OPENAI_API_KEY=sk-...your_openai_key_here
 OPENAI_MODEL=gpt-3.5-turbo
-CLIENT_URL=http://localhost:5174
+CLIENT_URL=http://localhost:5173
 PORT=5000
 ```
 
@@ -73,7 +73,7 @@ npm install
 npm run dev
 ```
 
-3. Open the app at `http://localhost:5174`
+3. Open the app at `http://localhost:5173`
 
 ## Testing the Streaming Analyze Flow
 - Ensure `OPENAI_API_KEY` is present in the server `.env`.
