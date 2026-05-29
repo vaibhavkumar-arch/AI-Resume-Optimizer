@@ -21,7 +21,42 @@ export const initializeAI = () => {
 };
 
 export const generateAnalysis = async (promptText) => {
-  // Prefer OpenAI if key provided (user requested OpenAI)
+  // 1. Prefer Groq if key provided (user key)
+  if (process.env.GROQ_API_KEY) {
+    try {
+      logger.info('Calling Groq for analysis...');
+      const groqRes = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+          messages: [{ role: 'user', content: promptText }],
+          temperature: 0.0,
+          response_format: { type: 'json_object' }
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 120000,
+        }
+      );
+
+      const text = groqRes.data?.choices?.[0]?.message?.content || '';
+      try {
+        return JSON.parse(text);
+      } catch (parseErr) {
+        logger.error('Failed to parse Groq JSON response', { parseErr: parseErr.message });
+        logger.error('Raw Groq response (truncated):', text.slice(0, 4000));
+        // Fall through to OpenAI/Gemini if parsing fails
+      }
+    } catch (groqErr) {
+      logger.error('Groq call failed:', groqErr.response?.data || groqErr.message || groqErr);
+      // Fall through to OpenAI/Gemini if API call fails
+    }
+  }
+
+  // 2. Fall back to OpenAI if key provided
   if (process.env.OPENAI_API_KEY) {
     try {
       logger.info('Calling OpenAI for analysis as fallback/provider...');
@@ -48,7 +83,7 @@ export const generateAnalysis = async (promptText) => {
       } catch (parseErr) {
         logger.error('Failed to parse OpenAI JSON response', { parseErr: parseErr.message });
         logger.error('Raw OpenAI response (truncated):', text.slice(0, 4000));
-        // fallthrough to Gemini path if OpenAI returned unparsable
+        // Fallthrough to Gemini path if OpenAI returned unparsable
       }
     } catch (openErr) {
       logger.error('OpenAI call failed:', openErr.message || openErr);
@@ -56,19 +91,16 @@ export const generateAnalysis = async (promptText) => {
     }
   }
 
+  // 3. Fall back to Gemini
   if (!model) initializeAI();
 
   try {
     const generationConfig = {
       responseMimeType: 'application/json',
-      // We could add a responseSchema here for stricter enforcement, 
-      // but the prompt is already very specific and responseMimeType: 'application/json' 
-      // usually suffices for Gemini 1.5/2.0
     };
 
     logger.info('Calling Gemini API for analysis...');
     
-    // Add a simple timeout wrap if needed, though sdk might handle it.
     const maxRetries = 3;
     const baseDelayMs = 1000;
 
@@ -91,7 +123,6 @@ export const generateAnalysis = async (promptText) => {
         }
       } catch (err) {
         const msg = err?.message || String(err);
-        // Retry for rate limits or transient network errors
         const isRateLimit = msg.includes('429') || /Too Many Requests/i.test(msg);
         const isTransient = /timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|NetworkError/i.test(msg);
 
@@ -104,11 +135,9 @@ export const generateAnalysis = async (promptText) => {
           continue;
         }
 
-        // No retry left or non-transient error
         throw err;
       }
     }
-    // If we somehow exit loop without returning, throw generic
     throw new Error('AI analysis failed after retries');
   } catch (error) {
     logger.error(`Gemini API Error in generateAnalysis: ${error.message}`);
@@ -117,6 +146,92 @@ export const generateAnalysis = async (promptText) => {
 };
 
 export const streamChatResponse = async (history, message, systemPrompt) => {
+  // Support Groq or OpenAI streaming chat response
+  if (process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY) {
+    const isGroq = !!process.env.GROQ_API_KEY;
+    const apiKey = isGroq ? process.env.GROQ_API_KEY : process.env.OPENAI_API_KEY;
+    const apiUrl = isGroq ? 'https://api.groq.com/openai/v1/chat/completions' : 'https://api.openai.com/v1/chat/completions';
+    const modelName = isGroq 
+      ? (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile')
+      : (process.env.OPENAI_MODEL || 'gpt-3.5-turbo');
+
+    logger.info(`Calling ${isGroq ? 'Groq' : 'OpenAI'} API for chat stream...`);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history.map(msg => ({
+        role: msg.role === 'model' ? 'assistant' : msg.role,
+        content: msg.content
+      })),
+      { role: 'user', content: message }
+    ];
+
+    try {
+      const response = await axios.post(
+        apiUrl,
+        {
+          model: modelName,
+          messages,
+          stream: true,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          responseType: 'stream',
+        }
+      );
+
+      // Async generator yielding objects containing a text() method to conform with Gemini's API
+      async function* makeGenerator() {
+        const stream = response.data;
+        let buffer = '';
+        
+        for await (const chunk of stream) {
+          buffer += chunk.toString('utf8');
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // Save the incomplete last line
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            if (trimmed === 'data: [DONE]') continue;
+            if (trimmed.startsWith('data: ')) {
+              try {
+                const parsed = JSON.parse(trimmed.slice(6));
+                const text = parsed.choices?.[0]?.delta?.content || '';
+                if (text) {
+                  yield { text: () => text };
+                }
+              } catch (err) {
+                // skip line parse errors
+              }
+            }
+          }
+        }
+
+        if (buffer && buffer.startsWith('data: ')) {
+          try {
+            const parsed = JSON.parse(buffer.slice(6));
+            const text = parsed.choices?.[0]?.delta?.content || '';
+            if (text) {
+              yield { text: () => text };
+            }
+          } catch (err) {
+            // ignore
+          }
+        }
+      }
+
+      return makeGenerator();
+    } catch (err) {
+      logger.error(`${isGroq ? 'Groq' : 'OpenAI'} streaming chat call failed: ${err.message}`);
+      // Fall through to Gemini path if error occurs
+    }
+  }
+
+  // Fall back to Gemini SDK
   if (!model) initializeAI();
 
   try {
@@ -125,10 +240,8 @@ export const streamChatResponse = async (history, message, systemPrompt) => {
       systemInstruction: systemPrompt,
     });
 
-    // Format history for Gemini API
-    // Gemini expects: { role: 'user' | 'model', parts: [{ text: '...' }] }
     const formattedHistory = history.map((msg) => ({
-      role: msg.role === 'assistant' ? 'model' : 'user',
+      role: msg.role === 'assistant' || msg.role === 'model' ? 'model' : 'user',
       parts: [{ text: msg.content }],
     }));
 

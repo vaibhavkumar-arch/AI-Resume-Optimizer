@@ -6,6 +6,7 @@ import axios from 'axios';
 import env from '../config/env.js';
 import { sendSuccess, sendError } from '../utils/responseHelper.js';
 import { extractTextFromPDF } from '../services/pdfService.js';
+import { getATSAnalysisPrompt } from '../prompts/atsAnalysisPrompt.js';
 
 export const analyzeResume = async (req, res, next) => {
   try {
@@ -104,7 +105,7 @@ export const deleteAnalysis = async (req, res, next) => {
   }
 };
 
-// Stream analysis using OpenAI streaming API (proxy to client). Sends token-level text
+// Stream analysis using OpenAI/Groq streaming API (proxy to client). Sends token-level text
 // and, on completion, saves the final analysis and sends a final control message.
 export const streamAnalyze = async (req, res, next) => {
   try {
@@ -119,14 +120,20 @@ export const streamAnalyze = async (req, res, next) => {
       return sendError(res, 'AUTH_ERROR', 'Not authorized to use this resume', 403);
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return sendError(res, 'NOT_CONFIGURED', 'OpenAI streaming not configured on server', 400);
+    if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
+      return sendError(res, 'NOT_CONFIGURED', 'OpenAI/Groq streaming not configured on server', 400);
     }
 
-    // Prepare OpenAI streaming request
-    const openaiUrl = 'https://api.openai.com/v1/chat/completions';
+    const isGroq = !!process.env.GROQ_API_KEY;
+    const apiKey = isGroq ? process.env.GROQ_API_KEY : process.env.OPENAI_API_KEY;
+    const apiUrl = isGroq ? 'https://api.groq.com/openai/v1/chat/completions' : 'https://api.openai.com/v1/chat/completions';
+    const modelName = isGroq 
+      ? (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile')
+      : (process.env.OPENAI_MODEL || 'gpt-3.5-turbo');
+
+    // Prepare streaming request headers
     const headers = {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     };
 
@@ -136,45 +143,47 @@ export const streamAnalyze = async (req, res, next) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
+    // Use full prompt generated with resume text and job description
+    const promptText = getATSAnalysisPrompt(resume.extractedText, jobDescription);
+
     const body = {
-      model: process.env.OPENAI_MODEL || env.openaiModel,
-      messages: [ { role: 'user', content: jobDescription + '\n\nPlease respond with a single JSON object matching the ATS schema.' } ],
+      model: modelName,
+      messages: [ { role: 'user', content: promptText } ],
       stream: true,
       temperature: 0.0,
     };
+    if (isGroq) {
+      body.response_format = { type: 'json_object' };
+    }
 
-    const openaiRes = await axios.post(openaiUrl, body, { headers, responseType: 'stream', timeout: 0 });
+    const streamResponse = await axios.post(apiUrl, body, { headers, responseType: 'stream', timeout: 0 });
 
-    const stream = openaiRes.data;
-    const reader = stream;
-
+    const stream = streamResponse.data;
     let buffer = '';
 
-    reader.on('data', async (chunk) => {
+    stream.on('data', async (chunk) => {
       const text = chunk.toString('utf8');
       // Forward raw token text to client
       res.write(text);
       buffer += text;
     });
 
-    reader.on('end', async () => {
-      // Attempt to extract final JSON from buffer
+    stream.on('end', async () => {
       try {
-        // OpenAI stream uses lines like: data: {"choices":[{"delta":{"content":"..."}}]}
-        const parts = buffer.split(/\ndata: /).map(p => p.trim()).filter(Boolean);
+        const lines = buffer.split('\n');
         let assembled = '';
-        for (const p of parts) {
-          if (p === '[DONE]') continue;
-          try {
-            const j = JSON.parse(p.replace(/^data:\s*/,''));
-            const delta = j.choices?.[0]?.delta?.content;
-            if (delta) assembled += delta;
-            const fin = j.choices?.[0]?.finish_reason;
-            if (fin) {
-              // finish
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (trimmed === 'data: [DONE]') continue;
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const j = JSON.parse(trimmed.slice(6));
+              const delta = j.choices?.[0]?.delta?.content;
+              if (delta) assembled += delta;
+            } catch (e) {
+              // skip parse errors
             }
-          } catch (e) {
-            // skip parse errors
           }
         }
 
@@ -183,7 +192,7 @@ export const streamAnalyze = async (req, res, next) => {
         try {
           analysisObj = JSON.parse(assembled);
         } catch (e) {
-          // Not parsable — fallback to server-side analyzer
+          console.error('Failed to parse streamed JSON. Falling back to non-streaming analyzer...', e);
           analysisObj = await analyzeResumeService(resume.extractedText, jobDescription);
         }
 
@@ -207,8 +216,8 @@ export const streamAnalyze = async (req, res, next) => {
       }
     });
 
-    reader.on('error', (err) => {
-      console.error('OpenAI stream error', err);
+    stream.on('error', (err) => {
+      console.error('API stream error', err);
       res.write('\n<<ANALYSIS_ERROR>>');
       res.end();
     });

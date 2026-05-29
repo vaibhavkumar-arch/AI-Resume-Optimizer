@@ -19,21 +19,31 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   const login = async (userData) => {
-    const data = await authService.login(userData);
-    if (data.success) {
-      setUser(data.data);
-      return data;
+    try {
+      const data = await authService.login(userData);
+      if (data.success) {
+        setUser(data.data);
+        return data;
+      }
+      throw new Error(data.error?.message || data.message || 'Login failed');
+    } catch (error) {
+      const msg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Login failed';
+      throw new Error(msg);
     }
-    throw new Error(data.message || 'Login failed');
   };
 
   const register = async (userData) => {
-    const data = await authService.register(userData);
-    if (data.success) {
-      setUser(data.data);
-      return data;
+    try {
+      const data = await authService.register(userData);
+      if (data.success) {
+        setUser(data.data);
+        return data;
+      }
+      throw new Error(data.error?.message || data.message || 'Registration failed');
+    } catch (error) {
+      const msg = error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Registration failed';
+      throw new Error(msg);
     }
-    throw new Error(data.message || 'Registration failed');
   };
 
   const logout = () => {

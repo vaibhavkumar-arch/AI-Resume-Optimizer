@@ -6,7 +6,6 @@
 const requiredVars = [
   { key: 'MONGODB_URI', description: 'MongoDB connection string' },
   { key: 'JWT_SECRET', description: 'JWT signing secret (min 32 chars recommended)' },
-  { key: 'GEMINI_API_KEY', description: 'Google Gemini API key from aistudio.google.com' },
 ];
 
 const optionalVarsWithDefaults = {
@@ -15,6 +14,7 @@ const optionalVarsWithDefaults = {
   JWT_EXPIRE: '7d',
   GEMINI_MODEL: 'gemini-2.0-flash',
   OPENAI_MODEL: 'gpt-3.5-turbo',
+  GROQ_MODEL: 'llama-3.3-70b-versatile',
   CLIENT_URL: 'http://localhost:5173',
   MAX_FILE_SIZE: '5242880',
   RATE_LIMIT_WINDOW_MS: '3600000',
@@ -29,6 +29,15 @@ function validateEnv() {
     if (!process.env[key] || process.env[key].trim() === '') {
       missing.push(`  - ${key}: ${description}`);
     }
+  }
+
+  // Ensure at least one LLM key is configured
+  const hasGemini = process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim() !== '';
+  const hasOpenAI = process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim() !== '';
+  const hasGroq = process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim() !== '';
+
+  if (!hasGemini && !hasOpenAI && !hasGroq) {
+    missing.push('  - LLM_API_KEY: At least one of GEMINI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY must be configured.');
   }
 
   if (missing.length > 0) {
@@ -57,6 +66,8 @@ const env = {
   get geminiApiKey() { return process.env.GEMINI_API_KEY; },
   get geminiModel() { return process.env.GEMINI_MODEL || 'gemini-2.0-flash'; },
   get openaiModel() { return process.env.OPENAI_MODEL || 'gpt-3.5-turbo'; },
+  get groqApiKey() { return process.env.GROQ_API_KEY; },
+  get groqModel() { return process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'; },
   get clientUrl() { return process.env.CLIENT_URL || 'http://localhost:5173'; },
   get maxFileSize() { return parseInt(process.env.MAX_FILE_SIZE, 10) || 5242880; },
   get rateLimitWindowMs() { return parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 3600000; },
